@@ -10,6 +10,9 @@ from sklearn.preprocessing import StandardScaler
 
 
 DATA = Path(__file__).resolve().parent / "data"
+RANDOM_STATE = 42
+MIN_K = 2
+MAX_K = 50
 
 # ชื่อย่อ, ไฟล์, latitude, longitude, เขต, รหัส/ชื่อ, ธงพิกัด
 SOURCES = [
@@ -171,11 +174,11 @@ def split_indices(cases):
 
     for area, group in cases.groupby("district", sort=True):
         indices = group.index.to_numpy().copy()
-        rng = np.random.RandomState(42 + sum(map(ord, area)))
+        rng = np.random.RandomState(RANDOM_STATE + sum(map(ord, area)))
         rng.shuffle(indices)
 
         count = (
-            min(len(indices) - 1, max(1, int(np.ceil(len(indices) * .2))))
+            min(len(indices) - 1, max(1, int(np.ceil(len(indices) * 0.2))))
             if len(indices) > 1 else 0
         )
 
@@ -188,16 +191,19 @@ def split_indices(cases):
     return train, test
 
 
+def get_silhouette(scaled, labels):
+    represented_clusters = len(np.unique(labels))
+
+    if 1 < represented_clusters < len(labels):
+        return silhouette_score(scaled, labels)
+
+    return None
+
+
 def evaluate(name, raw, scaled, labels, model):
     cluster_count = model.n_clusters
     counts = np.bincount(labels, minlength=cluster_count)
-    unique_labels = len(np.unique(labels))
-
-    silhouette = (
-        silhouette_score(scaled, labels)
-        if 1 < unique_labels < len(labels)
-        else None
-    )
+    silhouette = get_silhouette(scaled, labels)
 
     # Average squared distance to the assigned training centroid.
     squared_distances = (
@@ -206,10 +212,11 @@ def evaluate(name, raw, scaled, labels, model):
 
     print(f"\n{'=' * 75}\n{name}\n{'=' * 75}")
     print(f"Cases: {len(raw)}")
+    print(f"Clusters represented: {np.count_nonzero(counts)}/{cluster_count}")
     print(
         f"Silhouette: {silhouette:.4f}"
         if silhouette is not None
-        else "Silhouette: unavailable (not enough represented clusters)"
+        else "Silhouette: unavailable for this label distribution"
     )
     print(f"Mean squared centroid distance: {squared_distances.mean():.4f}")
 
@@ -228,88 +235,144 @@ def main():
     cases, features = load_features()
     train, test = split_indices(cases)
 
-    # Choose features from Train only.
+    # Split the original training set again to get a validation set.
+    # split_indices uses row index labels, so keep the original case indices.
+    fit_indices, validation_indices = split_indices(cases.iloc[train])
+
     columns = features.columns[
-        features.iloc[train].nunique() > 1
+        features.iloc[fit_indices].nunique() > 1
     ].tolist()
 
     if not columns:
-        raise ValueError("No nonconstant training features")
+        raise ValueError("No nonconstant features in the fitting set")
 
+    x_fit = features.iloc[fit_indices][columns]
+    x_validation = features.iloc[validation_indices][columns]
     x_train = features.iloc[train][columns].reset_index(drop=True)
     x_test = features.iloc[test][columns].reset_index(drop=True)
 
-    if not (
-        np.isfinite(x_train.to_numpy()).all()
-        and np.isfinite(x_test.to_numpy()).all()
+    if not all(
+        np.isfinite(frame.to_numpy()).all()
+        for frame in (x_fit, x_validation, x_test)
     ):
         raise ValueError("Features contain invalid numbers")
 
-    if len(np.unique(x_train.to_numpy(), axis=0)) < 2:
-        raise ValueError("Not enough distinct training cases")
+    search_scaler = StandardScaler()
+    fit_scaled = search_scaler.fit_transform(x_fit)
+    validation_scaled = search_scaler.transform(x_validation)
 
-    # Fit on Train only, then transform Test.
-    scaler = StandardScaler()
-    train_scaled = scaler.fit_transform(x_train)
-    test_scaled = scaler.transform(x_test)
+    distinct_fit_rows = len(np.unique(fit_scaled, axis=0))
+    max_supported_k = min(MAX_K, distinct_fit_rows)
 
-    # Same baseline settings as the previous seed-42 experiment.
-    model = KMeans(
-        n_clusters=2,
-        random_state=42,
-        n_init=10,
-    )
+    if max_supported_k < MIN_K:
+        raise ValueError("Not enough distinct fitting cases for K-Means")
 
-    train_labels = model.fit_predict(train_scaled)
-    test_labels = model.predict(test_scaled)
-
+    print(f"\nTotal locations: {len(cases)}")
     print(
-        f"\nTotal={len(cases)}, Train={len(train)}, Test={len(test)}"
+        f"Fit: {len(x_fit)}, Validation: {len(x_validation)}, "
+        f"Final Test: {len(x_test)}"
     )
     print(f"Features: {columns}")
     print("Population is district-wide; nearby counts use a 1 km radius.")
+    print(f"\nCOMPARING K={MIN_K} TO K={max_supported_k}")
+
+    if max_supported_k < MAX_K:
+        print(f"K={max_supported_k + 1} to {MAX_K} require more distinct fitting cases.")
+
+    results = []
+
+    for k in range(MIN_K, max_supported_k + 1):
+        model = KMeans(n_clusters=k, random_state=RANDOM_STATE, n_init=10)
+        fit_labels = model.fit_predict(fit_scaled)
+        fit_counts = np.bincount(fit_labels, minlength=k)
+
+        if (fit_counts == 0).any():
+            print(f"K={k:2d} | skipped: fewer than {k} clusters formed")
+            continue
+
+        validation_labels = model.predict(validation_scaled)
+        validation_coverage = len(np.unique(validation_labels))
+        score = get_silhouette(validation_scaled, validation_labels)
+        coverage = f"validation clusters={validation_coverage}/{k}"
+        smallest_cluster = int(fit_counts.min())
+
+        if score is None:
+            print(f"K={k:2d} | silhouette unavailable | {coverage}")
+            continue
+
+        results.append({
+            "K": k,
+            "validation_silhouette": score,
+            "validation_clusters": validation_coverage,
+            "smallest_fit_cluster": smallest_cluster,
+        })
+
+        print(
+            f"K={k:2d} | silhouette={score:.4f} | "
+            f"{coverage} | smallest fit cluster={smallest_cluster}"
+        )
+
+    if not results:
+        raise ValueError("No candidate K produced a valid validation silhouette")
+
+    ranking = pd.DataFrame(results).sort_values(
+        ["validation_silhouette", "K"],
+        ascending=[False, True],
+    )
+
+    print("\nTOP 10 K VALUES BY VALIDATION SILHOUETTE")
+    print(ranking.head(10).round(4).to_string(index=False))
+
+    best_k = int(ranking.iloc[0]["K"])
+    print(f"\nBest K by validation silhouette: {best_k}")
+
+    # Refit the winning K on all original training rows.
+    final_scaler = StandardScaler()
+    train_scaled = final_scaler.fit_transform(x_train)
+    test_scaled = final_scaler.transform(x_test)
+
+    final_model = KMeans(
+        n_clusters=best_k,
+        random_state=RANDOM_STATE,
+        n_init=10,
+    )
+
+    train_labels = final_model.fit_predict(train_scaled)
+    test_labels = final_model.predict(test_scaled)
 
     train_score = evaluate(
-        "TRAIN — K=2",
+        f"FINAL TRAIN — K={best_k}",
         x_train,
         train_scaled,
         train_labels,
-        model,
+        final_model,
     )
 
     test_score = evaluate(
-        "TEST — K=2",
+        f"FINAL TEST — K={best_k}",
         x_test,
         test_scaled,
         test_labels,
-        model,
+        final_model,
     )
 
     if train_score is not None and test_score is not None:
-        print(
-            f"\nTrain minus Test Silhouette: "
-            f"{train_score - test_score:+.4f}"
-        )
+        print(f"\nTrain minus Test Silhouette: {train_score - test_score:+.4f}")
 
     test_cases = cases.iloc[test].reset_index(drop=True)
     test_cases["cluster"] = test_labels
 
     print("\nTOP 5 TEST DISTRICTS PER CLUSTER")
 
-    for cluster in range(2):
+    for cluster in range(best_k):
         top = (
-            test_cases.loc[
-                test_cases["cluster"] == cluster, "district"
-            ]
+            test_cases.loc[test_cases["cluster"] == cluster, "district"]
             .value_counts()
             .head(5)
         )
         print(f"Cluster {cluster}: {top.to_dict()}")
 
-    print("\nDone. No files or models were saved.")
-    print("Test labels come from the fitted training K-Means.")
-    print("Silhouette measures separation, not prediction accuracy.")
-    print("Nearby Train/Test points may have overlapping 1 km areas.")
+    print("\nNearby Train/Validation/Test points may have overlapping 1 km areas.")
 
 
 if __name__ == "__main__":

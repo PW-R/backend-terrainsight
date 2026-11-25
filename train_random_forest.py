@@ -4,128 +4,100 @@ import pandas as pd
 from sklearn.cluster import KMeans
 from sklearn.dummy import DummyClassifier
 from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import (
-    accuracy_score,
-    balanced_accuracy_score,
-    classification_report,
-    confusion_matrix,
-    f1_score,
-)
+from sklearn.metrics import accuracy_score, classification_report
 from sklearn.preprocessing import StandardScaler
 
-# ใช้ evaluate_kmeans.py เวอร์ชันล่าสุดที่มีสองฟังก์ชันนี้
 from evaluate_kmeans import load_features, split_indices
 
 
+K = 10
 RANDOM_STATE = 42
-LABELS = [0, 1]
+
+FEATURE_NAMES = {
+    "population": "district population",
+    "temples": "nearby temples",
+    "malls": "nearby malls",
+    "health": "nearby health centers",
+    "risk": "nearby recorded risk points",
+    "schools": "nearby schools",
+    "universities": "nearby universities",
+}
 
 
-def evaluate(name, actual, predicted):
-    print(f"\n{'=' * 75}\n{name}\n{'=' * 75}")
+def describe_clusters(x_train, train_scaled, y_train, y_test):
+    averages = x_train.assign(cluster=y_train).groupby("cluster").mean()
 
-    print(f"Accuracy:          {accuracy_score(actual, predicted):.4f}")
-    print(
-        f"Balanced Accuracy: "
-        f"{balanced_accuracy_score(actual, predicted):.4f}"
-    )
-    print(
-        f"Macro F1:          "
-        f"{f1_score(actual, predicted, labels=LABELS, average='macro', zero_division=0):.4f}"
-    )
+    standardized = pd.DataFrame(train_scaled, columns=x_train.columns)
+    differences = standardized.assign(cluster=y_train).groupby("cluster").mean()
 
-    print("\nCLASSIFICATION REPORT")
-    print(classification_report(
-        actual,
-        predicted,
-        labels=LABELS,
-        target_names=["Cluster 0", "Cluster 1"],
-        digits=4,
-        zero_division=0,
-    ))
+    names = {}
 
-    matrix = pd.DataFrame(
-        confusion_matrix(actual, predicted, labels=LABELS),
-        index=["KMeans 0", "KMeans 1"],
-        columns=["Predicted 0", "Predicted 1"],
-    )
+    for cluster, row in differences.iterrows():
+        # Compare each group's average with the overall training average.
+        standout_features = row.abs().nlargest(2).index
+        descriptions = []
 
-    print("CONFUSION MATRIX — rows=K-Means, columns=classifier")
-    print(matrix.to_string())
+        for feature in standout_features:
+            difference = row[feature]
 
+            if abs(difference) < 0.25:
+                continue
 
-def show_distribution(name, labels):
-    counts = np.bincount(labels, minlength=2)
-    print(
-        f"{name}: Cluster 0={counts[0]} ({counts[0] / len(labels):.1%}), "
-        f"Cluster 1={counts[1]} ({counts[1] / len(labels):.1%})"
-    )
+            if feature == "population":
+                direction = "higher" if difference > 0 else "lower"
+            else:
+                direction = "more" if difference > 0 else "fewer"
+
+            descriptions.append(f"{direction} {FEATURE_NAMES[feature]}")
+
+        name = " and ".join(descriptions).capitalize() or "Mixed profile"
+        names[cluster] = name
+
+    train_counts = pd.Series(y_train).value_counts()
+    test_counts = pd.Series(y_test).value_counts()
+
+    averages.insert(0, "test_locations", test_counts.reindex(averages.index, fill_value=0))
+    averages.insert(0, "train_locations", train_counts.reindex(averages.index))
+    averages.insert(0, "suggested_name", pd.Series(names))
+
+    return averages
 
 
 def main():
     cases, features = load_features()
     train_indices, test_indices = split_indices(cases)
 
-    # เลือก features จาก Train เท่านั้น
-    columns = features.columns[
-        features.iloc[train_indices].nunique() > 1
-    ].tolist()
+    # Select features using all training locations now that K is fixed.
+    train_features = features.iloc[train_indices]
+    columns = train_features.columns[train_features.nunique() > 1].tolist()
 
     if not columns:
         raise ValueError("No nonconstant training features")
 
-    x_train = features.iloc[train_indices][columns].reset_index(drop=True)
+    x_train = train_features[columns].reset_index(drop=True)
     x_test = features.iloc[test_indices][columns].reset_index(drop=True)
 
-    if not (
-        np.isfinite(x_train.to_numpy()).all()
-        and np.isfinite(x_test.to_numpy()).all()
-    ):
+    if not all(np.isfinite(frame.to_numpy()).all() for frame in (x_train, x_test)):
         raise ValueError("Features contain invalid numbers")
 
-    if len(np.unique(x_train.to_numpy(), axis=0)) < 2:
-        raise ValueError("Not enough distinct training cases")
+    if len(x_train.drop_duplicates()) < K:
+        raise ValueError(f"Need at least {K} distinct training feature rows")
 
-    # K-Means ต้องใช้ข้อมูลปรับสเกล
+    # K-Means uses scaled features. Random Forest uses the original values.
     scaler = StandardScaler()
     train_scaled = scaler.fit_transform(x_train)
-    test_scaled = scaler.transform(x_test)
 
-    kmeans = KMeans(
-        n_clusters=2,
-        random_state=RANDOM_STATE,
-        n_init=10,
-    )
-
+    kmeans = KMeans(n_clusters=K, random_state=RANDOM_STATE, n_init=10)
     y_train = kmeans.fit_predict(train_scaled)
-    y_test = kmeans.predict(test_scaled)
 
-    if len(np.unique(y_train)) != 2:
-        raise ValueError("K-Means did not produce two training clusters")
+    if len(np.unique(y_train)) != K:
+        raise ValueError(f"K-Means formed fewer than {K} groups")
 
-    print(f"\n{'=' * 75}")
-    print("TERRA INSIGHT — RANDOM FOREST CLASSIFICATION")
-    print(f"{'=' * 75}")
-    print(f"Total cases: {len(cases)}")
-    print(f"Train: {len(x_train)}, Test: {len(x_test)}")
-    print(f"Features: {columns}")
-    print("Target: cluster assigned by training-fitted K-Means")
-    print("Population is district-wide; nearby counts use a 1 km radius.")
+    y_test = kmeans.predict(scaler.transform(x_test))
 
-    show_distribution("Train", y_train)
-    show_distribution("Test ", y_test)
-
-    # Baseline สำหรับตรวจว่า RF ดีกว่าทายกลุ่มส่วนใหญ่เสมอหรือไม่
     baseline = DummyClassifier(strategy="most_frequent")
     baseline.fit(x_train, y_train)
 
-    evaluate(
-        "BASELINE — TEST",
-        y_test,
-        baseline.predict(x_test),
-    )
-
-    # RF ใช้ features หน่วยเดิมได้ ไม่จำเป็นต้องปรับสเกล
     forest = RandomForestClassifier(
         n_estimators=300,
         min_samples_leaf=2,
@@ -133,56 +105,31 @@ def main():
         random_state=RANDOM_STATE,
         n_jobs=-1,
     )
-
     forest.fit(x_train, y_train)
 
-    train_pred = forest.predict(x_train)
-    test_pred = forest.predict(x_test)
+    predicted = forest.predict(x_test)
+    profiles = describe_clusters(x_train, train_scaled, y_train, y_test)
+    matches = int(np.count_nonzero(y_test == predicted))
 
-    evaluate("RANDOM FOREST — TRAIN", y_train, train_pred)
-    evaluate("RANDOM FOREST — TEST", y_test, test_pred)
+    print(f"\nTERRA INSIGHT — K-MEANS + RANDOM FOREST (K={K})")
+    print(f"Train: {len(x_train)}, Test: {len(x_test)}")
 
-    print("\nTRAIN–TEST MACRO F1 GAP")
-    train_f1 = f1_score(
-        y_train, train_pred,
-        labels=LABELS, average="macro", zero_division=0,
-    )
-    test_f1 = f1_score(
-        y_test, test_pred,
-        labels=LABELS, average="macro", zero_division=0,
-    )
-    print(f"Train minus Test: {train_f1 - test_f1:+.4f}")
+    print("\nSUGGESTED GROUP NAMES AND AVERAGE FEATURES")
+    print(profiles.round(2).to_string())
+    print("\nPopulation covers the whole district. Nearby counts use a 1 km radius.")
 
-    # เป็นความสำคัญจากการแบ่งต้นไม้ ไม่ใช่หลักฐานเชิงสาเหตุ
-    importance = pd.DataFrame({
-        "feature": columns,
-        "tree_importance": forest.feature_importances_,
-    }).sort_values("tree_importance", ascending=False)
-
-    print("\nFEATURE IMPORTANCE — TREE SPLITS, NOT CAUSAL EFFECTS")
-    print(importance.round(4).to_string(index=False))
-
-    results = cases.iloc[test_indices][
-        ["district", "lat", "lon"]
-    ].reset_index(drop=True)
-
-    results["kmeans_cluster"] = y_test
-    results["rf_cluster"] = test_pred
-
-    mismatches = results[
-        results["kmeans_cluster"] != results["rf_cluster"]
-    ]
-
-    print(f"\nTEST DISAGREEMENTS: {len(mismatches)}/{len(results)}")
-    if not mismatches.empty:
-        print(mismatches.head(20).to_string(index=False))
-
-    print("\nFIRST 10 TEST PREDICTIONS")
-    print(results.head(10).to_string(index=False))
-
-    print("\nDone. No files or models were saved.")
-    print("Scores measure agreement with K-Means, not real-world suitability.")
-    print("Nearby Train/Test points may have overlapping 1 km areas.")
+    print("\nRANDOM FOREST TEST RESULTS")
+    print(f"Majority-group baseline accuracy: {accuracy_score(y_test, baseline.predict(x_test)):.2%}")
+    print(f"Random Forest matched K-Means: {matches}/{len(y_test)} ({matches / len(y_test):.2%})")
+    print()
+    print(classification_report(
+        y_test,
+        predicted,
+        labels=list(range(K)),
+        target_names=[f"Group {cluster}" for cluster in range(K)],
+        digits=4,
+        zero_division=0,
+    ))
 
 
 if __name__ == "__main__":
