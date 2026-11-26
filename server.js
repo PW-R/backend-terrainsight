@@ -8,28 +8,54 @@ const python = process.env.PYTHON_BIN ||
   (process.platform === "win32" ? "python" : "python3");
 const modelPath = path.join(__dirname, "terra_insight_model.joblib");
 
+const MAX_BODY_BYTES = 4096;
+const MAX_PENDING = 32;
+const PREDICTION_TIMEOUT_MS = 10000;
+
 const loader = `
+import json
 import sys
+import traceback
 import warnings
 
 import joblib
+import pandas as pd
 from sklearn.exceptions import InconsistentVersionWarning
 
 warnings.simplefilter("error", InconsistentVersionWarning)
 bundle = joblib.load(sys.argv[1])
 
-if not callable(getattr(bundle["model"], "predict", None)):
+model = bundle["model"]
+columns = bundle["feature_columns"]
+group_names = bundle["group_names"]
+
+if not callable(getattr(model, "predict", None)):
     raise ValueError("The saved bundle has no prediction model")
 
-print("MODEL_READY", flush=True)
+print(json.dumps({"ready": True, "columns": columns}), flush=True)
 
-# Keep the model in memory until Node closes the pipe.
-for _ in sys.stdin:
-    pass
+for line in sys.stdin:
+    request = json.loads(line)
+    response = {"id": request["id"]}
+
+    try:
+        row = pd.DataFrame([request["features"]], columns=columns)
+        group_id = int(model.predict(row)[0])
+        response["result"] = {
+            "group_id": group_id,
+            "group_name": group_names[group_id],
+        }
+    except Exception:
+        traceback.print_exc(file=sys.stderr)
+        response["error"] = "Prediction failed"
+
+    print(json.dumps(response), flush=True)
 `;
 
-let modelLoaded = false;
+let featureColumns = null;
 let shuttingDown = false;
+let nextId = 0;
+const pending = new Map();
 
 const worker = spawn(python, ["-u", "-c", loader, modelPath], {
   stdio: ["pipe", "pipe", "inherit"],
@@ -37,41 +63,174 @@ const worker = spawn(python, ["-u", "-c", loader, modelPath], {
 
 const output = createInterface({ input: worker.stdout });
 
+function sendJson(res, status, body) {
+  if (res.destroyed || res.writableEnded) return;
+  res.writeHead(status, { "Content-Type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(body));
+}
+
+function finishPrediction(id, status, body) {
+  const request = pending.get(id);
+  if (!request) return;
+
+  pending.delete(id);
+  clearTimeout(request.timer);
+  sendJson(request.res, status, body);
+}
+
 output.on("line", (line) => {
-  if (line === "MODEL_READY") {
-    modelLoaded = true;
-    console.log("Terra Insight model loaded.");
-  }
-});
+  let message;
 
-const server = http.createServer((req, res) => {
-  res.setHeader("Content-Type", "application/json; charset=utf-8");
-  res.setHeader("Access-Control-Allow-Origin", "*");
-
-  if (req.method === "GET" && req.url === "/health") {
-    res.writeHead(modelLoaded ? 200 : 503);
-    res.end(JSON.stringify({
-      status: modelLoaded ? "ready" : "loading",
-      model_loaded: modelLoaded,
-    }));
+  try {
+    message = JSON.parse(line);
+  } catch {
+    console.error("Unexpected output from the Python worker.");
+    shutdown(1);
     return;
   }
 
-  res.writeHead(404);
-  res.end(JSON.stringify({ error: "Route not found" }));
+  if (message.ready) {
+    featureColumns = message.columns;
+    console.log("Terra Insight model loaded.");
+    return;
+  }
+
+  if (message.error) {
+    finishPrediction(message.id, 500, { error: message.error });
+    return;
+  }
+
+  finishPrediction(message.id, 200, message.result);
+});
+
+async function predict(req, res) {
+  const contentType = req.headers["content-type"]?.split(";")[0].trim();
+  if (contentType !== "application/json") {
+    sendJson(res, 415, { error: "Send Content-Type: application/json" });
+    req.resume();
+    return;
+  }
+
+  // Keep only a small JSON body in memory.
+  const chunks = [];
+  let bytes = 0;
+
+  for await (const chunk of req) {
+    bytes += chunk.length;
+    if (bytes > MAX_BODY_BYTES) {
+      res.setHeader("Connection", "close");
+      sendJson(res, 413, { error: "Request body is too large" });
+      // Preserve the connection long enough to send the error response.
+      req.resume();
+      return;
+    }
+    chunks.push(chunk);
+  }
+
+  let features;
+  try {
+    features = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+  } catch {
+    sendJson(res, 400, { error: "Invalid JSON" });
+    return;
+  }
+
+  if (!featureColumns || shuttingDown) {
+    sendJson(res, 503, { error: "Model is unavailable" });
+    return;
+  }
+
+  if (
+    !features ||
+    typeof features !== "object" ||
+    Array.isArray(features) ||
+    Object.keys(features).length !== featureColumns.length ||
+    featureColumns.some((column) =>
+      !Object.hasOwn(features, column) ||
+      !Number.isSafeInteger(features[column]) ||
+      features[column] < 0
+    )
+  ) {
+    sendJson(res, 422, {
+      error: "Send every model feature as a nonnegative whole number",
+      required_features: featureColumns,
+    });
+    return;
+  }
+
+  if (pending.size >= MAX_PENDING) {
+    sendJson(res, 503, { error: "Prediction queue is full. Try again shortly." });
+    return;
+  }
+
+  const id = ++nextId;
+  const timer = setTimeout(() => {
+    finishPrediction(id, 504, { error: "Prediction timed out" });
+  }, PREDICTION_TIMEOUT_MS);
+
+  pending.set(id, { res, timer });
+
+  worker.stdin.write(`${JSON.stringify({ id, features })}\n`, (error) => {
+    if (error) {
+      finishPrediction(id, 503, { error: "Model is unavailable" });
+    }
+  });
+}
+
+const server = http.createServer((req, res) => {
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  const route = req.url.split("?")[0];
+
+  if (req.method === "OPTIONS" && route === "/predict") {
+    res.writeHead(204).end();
+    return;
+  }
+
+  if (req.method === "GET" && route === "/health") {
+    const ready = Boolean(featureColumns) && !shuttingDown;
+    sendJson(res, ready ? 200 : 503, {
+      status: ready ? "ready" : "unavailable",
+      model_loaded: ready,
+    });
+    return;
+  }
+
+  if (req.method === "POST" && route === "/predict") {
+    predict(req, res).catch((error) => {
+      console.error(`Prediction request failed: ${error.message}`);
+      sendJson(res, 500, { error: "Could not process prediction request" });
+    });
+    return;
+  }
+
+  sendJson(res, 404, { error: "Route not found" });
 });
 
 function shutdown(exitCode) {
   if (shuttingDown) return;
 
   shuttingDown = true;
+  featureColumns = null;
   process.exitCode = exitCode;
+
+  for (const id of pending.keys()) {
+    finishPrediction(id, 503, { error: "Model is unavailable" });
+  }
+
   server.close();
   worker.stdin.end();
-
-  // Give the worker time to exit, even if it is still loading the model.
   setTimeout(() => worker.kill(), 5000).unref();
 }
+
+worker.stdin.on("error", (error) => {
+  if (!shuttingDown) {
+    console.error(`Python worker connection failed: ${error.message}`);
+    shutdown(1);
+  }
+});
 
 worker.on("error", (error) => {
   console.error(`Could not start Python: ${error.message}`);
@@ -79,10 +238,8 @@ worker.on("error", (error) => {
 });
 
 worker.on("exit", (code, signal) => {
-  modelLoaded = false;
-
   if (!shuttingDown) {
-    console.error(`Python model loader stopped: ${signal ?? code}`);
+    console.error(`Python worker stopped: ${signal ?? code}`);
     shutdown(1);
   }
 });
