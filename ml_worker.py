@@ -8,6 +8,7 @@ import traceback
 from pathlib import Path
 from contextlib import redirect_stdout
 from urllib.parse import urlencode
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 import joblib
@@ -246,6 +247,24 @@ def geocode_location(location):
             if data:
                 results = data
                 break
+
+        except HTTPError as error:
+            last_error = error
+            headers = error.headers or {}
+            try:
+                with error:
+                    body = error.read(1000).decode("utf-8", errors="replace")
+            except (OSError, ValueError):
+                body = "(unavailable)"
+            print(
+                f"Geocoding HTTP {error.code} | "
+                f"Server: {headers.get('Server', '-')} | "
+                f"Via: {headers.get('Via', '-')} | "
+                f"Retry-After: {headers.get('Retry-After', '-')} | "
+                f"Body: {body!r}",
+                file=sys.stderr,
+                flush=True,
+            )
 
         except Exception as error:
             last_error = error
