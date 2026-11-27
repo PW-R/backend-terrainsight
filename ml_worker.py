@@ -15,6 +15,8 @@ import numpy as np
 import pandas as pd
 
 from train_and_save_model import load_features
+# บัวเพิ่มคับพี่ๆ
+from district_profiles import build_district_profiles
 
 # ==========================================
 # UTF-8 Encoding Configuration
@@ -932,6 +934,13 @@ print(
             "model_features": feature_columns,
 
             "recommendation_limit": MAX_RECOMMENDATIONS,
+            # บัวเพิ่มจ่ะพี่หน้าเปรียบเทียบเขต (Compare)
+            "district_profiles": build_district_profiles(
+                bundle,
+                cases,
+                features,
+                predictions,
+            ),
         },
         ensure_ascii=True,
     ),

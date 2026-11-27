@@ -43,6 +43,7 @@ const REQUIRED_FACTORS = [
 
 let workerReady = false;
 let districtCount = 0;
+let districtProfiles = null; // บัวเพิ่มหน้า Compare
 let shuttingDown = false;
 let nextId = 0;
 
@@ -109,7 +110,8 @@ output.on("line", (line) => {
   if (message.ready === true) {
     workerReady = true;
     districtCount = message.district_count || 0;
-
+    // บัวเพิ่มคับพี่
+    districtProfiles = message.district_profiles || null;
     console.log("TerraInsight Model loaded.");
     console.log(`Districts prepared: ${districtCount}`);
 
@@ -403,6 +405,21 @@ const server = http.createServer((req, res) => {
       });
     });
 
+    return;
+  }
+     // บัวเพิ่มคับพี่
+    // Compare page: district profiles
+  if (req.method === "GET" && route === "/api/districts/profiles") {
+    if (!districtProfiles) {
+      sendJson(res, 503, {
+        success: false,
+        error: "District profiles are not ready",
+      });
+
+      return;
+    }
+
+    sendJson(res, 200, districtProfiles);
     return;
   }
 
