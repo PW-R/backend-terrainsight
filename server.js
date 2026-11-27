@@ -3,6 +3,7 @@ const http = require("node:http");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { createInterface } = require("node:readline");
+const { handleDataRequest } = require("./data-api");
 
 // ==========================================
 // 1. Configuration
@@ -423,6 +424,7 @@ const server = http.createServer((req, res) => {
     return;
   }
 
+  if (handleDataRequest(req, res)) return;
   sendJson(res, 404, {
     success: false,
     error: "Route not found",
