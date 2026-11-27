@@ -3,6 +3,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 const { createInterface } = require("node:readline");
 const { handleDashboardRoute } = require("./dashboardRoutes.js");
+const { handleDataRequest } = require("./data-api");
 
 const port = Number(process.env.PORT || 3000);
 const python =
@@ -293,6 +294,7 @@ const server = http.createServer((req, res) => {
 
   // Dashboard, district list, district details, and search
   if (handleDashboardRoute(req, res, sendJson)) return;
+  if (handleDataRequest(req, res)) return;
 
   sendJson(res, 404, {
     success: false,

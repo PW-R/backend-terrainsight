@@ -1,31 +1,17 @@
-// API ข้อมูลสำหรับ frontend (Dashboard + ค้นหาเขต)
-// อ่าน CSV ใน ./data ครั้งเดียวตอนเริ่ม server แล้วตอบเป็น JSON
-// ไฟล์นี้ไม่แตะโมเดลหรือ /predict เลย
+// data-api.js: API รายละเอียดเขต สำหรับช่องค้นหาบน navbar
+//   GET /api/district-details/:ชื่อเขตหรือรหัสเขต
+// อ่านข้อมูลจาก CSV ใน ./data ตอนเริ่ม server ทั้งหมด (ไม่มีข้อมูลเขียนไว้ในโค้ด)
+// ไฟล์นี้ไม่แตะโมเดล /predict และไม่ยุ่งกับ route Dashboard ของ dashboardRoutes.js
 //
 // ใช้ได้ 2 แบบ:
-//   1) ต่อกับ server.js ของเดิม (ดู README-API.md)
-//   2) รันเดี่ยว: node data-api.js   (port 3001 หรือ DATA_PORT)
+//   1) ใน server.js: if (handleDataRequest(req, res)) return;  (วางต่อจาก handleDashboardRoute)
+//   2) รันเดี่ยวเพื่อทดสอบ: node data-api.js   (port 3001 หรือ DATA_PORT)
 
 const fs = require("node:fs");
 const path = require("node:path");
 const http = require("node:http");
 
 const DATA_DIR = path.join(__dirname, "data");
-
-// รหัสเขตของกรุงเทพมหานคร ใช้เป็น id กลางของทุก endpoint
-// ตอนเริ่ม server จะเทียบกับคอลัมน์ dcode ในไฟล์ห้างและมหาวิทยาลัยอีกรอบ
-const DISTRICT_CODES = {
-  พระนคร: 1001, ดุสิต: 1002, หนองจอก: 1003, บางรัก: 1004, บางเขน: 1005,
-  บางกะปิ: 1006, ปทุมวัน: 1007, ป้อมปราบศัตรูพ่าย: 1008, พระโขนง: 1009, มีนบุรี: 1010,
-  ลาดกระบัง: 1011, ยานนาวา: 1012, สัมพันธวงศ์: 1013, พญาไท: 1014, ธนบุรี: 1015,
-  บางกอกใหญ่: 1016, ห้วยขวาง: 1017, คลองสาน: 1018, ตลิ่งชัน: 1019, บางกอกน้อย: 1020,
-  บางขุนเทียน: 1021, ภาษีเจริญ: 1022, หนองแขม: 1023, ราษฎร์บูรณะ: 1024, บางพลัด: 1025,
-  ดินแดง: 1026, บึงกุ่ม: 1027, สาทร: 1028, บางซื่อ: 1029, จตุจักร: 1030,
-  บางคอแหลม: 1031, ประเวศ: 1032, คลองเตย: 1033, สวนหลวง: 1034, จอมทอง: 1035,
-  ดอนเมือง: 1036, ราชเทวี: 1037, ลาดพร้าว: 1038, วัฒนา: 1039, บางแค: 1040,
-  หลักสี่: 1041, สายไหม: 1042, คันนายาว: 1043, สะพานสูง: 1044, วังทองหลาง: 1045,
-  คลองสามวา: 1046, บางนา: 1047, ทวีวัฒนา: 1048, ทุ่งครุ: 1049, บางบอน: 1050,
-};
 
 // ประเภทสถานที่: key ตรงกับ placeTypes ใน Dashboard
 // เงื่อนไขกรองใช้แบบเดียวกับ train_and_save_model.py (จุดเสี่ยงเอาปีล่าสุด, ตัดพิกัดผิดปกติ)
@@ -39,6 +25,7 @@ const PLACE_SOURCES = [
 ];
 // ไม่นับจุดเสี่ยงรวมใน "สถานที่สำคัญ"
 const LANDMARK_KEYS = ["temple", "mall", "health", "school", "university"];
+
 
 // ---------- อ่าน CSV (รองรับช่องที่มี , อยู่ในเครื่องหมายคำพูด) ----------
 function parseCsv(text) {
@@ -75,10 +62,17 @@ function readCsv(fileName) {
   return parseCsv(fs.readFileSync(filePath, "utf8"));
 }
 
-// ไฟล์จำนวนบ้านชื่อยาวและเป็นภาษาไทย หาไฟล์ที่ลงท้ายด้วยช่วงปี 2556-2565
+// หาไฟล์จำนวนบ้านจากหัวคอลัมน์ (มีคอลัมน์ district และคอลัมน์ปีแบบ Y2556, Y2557, ...)
+// ไม่ผูกกับชื่อไฟล์หรือช่วงปี เพิ่มปีใหม่ในไฟล์ได้เลย
 function findHouseholdFile() {
-  const match = fs.readdirSync(DATA_DIR).find((name) => /2556.*2565.*\.csv$/i.test(name));
-  if (!match) throw new Error("ไม่พบไฟล์จำนวนบ้าน (ชื่อไฟล์ควรมี 2556 ... 2565)");
+  const match = fs.readdirSync(DATA_DIR)
+    .filter((name) => name.toLowerCase().endsWith(".csv"))
+    .find((name) => {
+      const header = fs.readFileSync(path.join(DATA_DIR, name), "utf8").split(/\r?\n/, 1)[0].replace(/^\uFEFF/, "");
+      const columns = header.split(",").map((column) => column.trim());
+      return columns.includes("district") && columns.some((column) => /^Y\d{4}$/.test(column));
+    });
+  if (!match) throw new Error("ไม่พบไฟล์จำนวนบ้าน (ต้องมีคอลัมน์ district และคอลัมน์ปี เช่น Y2565)");
   return match;
 }
 
@@ -101,33 +95,47 @@ function isFlagged(value) {
 function buildData() {
   const warnings = [];
 
+  // รหัสเขต (dcode) อ่านจากข้อมูล ไม่ได้เขียนไว้ในโค้ด:
+  // ขอบเขตเขต data/bangkok-districts.json + คอลัมน์ dcode ในไฟล์ห้างและมหาวิทยาลัย
+  const geoFile = path.join(DATA_DIR, "bangkok-districts.json");
+  const geo = fs.existsSync(geoFile) ? JSON.parse(fs.readFileSync(geoFile, "utf8")) : null;
+  if (!geo) warnings.push("ไม่พบ data/bangkok-districts.json จึงไม่มีพื้นที่และความหนาแน่น");
+
+  // กรอบพิกัดกรุงเทพฯ คำนวณจากขอบเขตเขต ใช้ตัดพิกัดที่ผิดปกติ (ถ้าไม่มีไฟล์ขอบเขต จะไม่ตัด)
+  const bounds = geo ? geometryBounds(geo.features.map(({ geometry }) => geometry)) : null;
+
+  const codes = new Map();
+  const addCode = (name, code) => {
+    const shortName = normalizeDistrict(name);
+    const value = toNumber(code);
+    if (!shortName || value == null) return;
+    if (codes.has(shortName) && codes.get(shortName) !== String(value)) {
+      warnings.push(`dcode ไม่ตรงกัน: ${shortName} ${codes.get(shortName)} / ${value}`);
+      return;
+    }
+    codes.set(shortName, String(value));
+  };
+  for (const feature of geo?.features ?? []) addCode(feature.properties?.dname, feature.properties?.dcode);
+  for (const row of readCsv("cleaned ที่ตั้งห้างสรรพสินค้า.csv")) addCode(row.dname, row.dcode);
+  for (const row of readCsv("universities_clean.csv")) addCode(row.DISTRICT, row.dcode);
+
   // ประชากร = รายชื่อ 50 เขตหลัก
   const districts = readCsv("bangkok_population_clean.csv").map((row) => {
     const shortName = normalizeDistrict(row["เขต"]);
-    const code = DISTRICT_CODES[shortName];
-    if (!code) throw new Error(`ไม่รู้จักรหัสเขต: ${shortName}`);
+    const code = codes.get(shortName);
+    if (!code) warnings.push(`ไม่พบรหัสเขตของ ${shortName} ในข้อมูล ใช้ชื่อเขตเป็น id แทน`);
     return {
-      id: String(code),
+      id: code ?? shortName,
       name: `เขต${shortName}`,
       shortName,
       population: toNumber(row["รวม"]),
       male: toNumber(row["ชาย"]),
       female: toNumber(row["หญิง"]),
-      area: null, // ยังไม่มีข้อมูลพื้นที่เขตใน backend
+      area: null, // เติมจากขอบเขตเขตด้านล่าง
     };
-  }).sort((a, b) => Number(a.id) - Number(b.id));
+  }).sort((a, b) => String(a.id).localeCompare(String(b.id)));
 
   const byShortName = new Map(districts.map((district) => [district.shortName, district]));
-
-  // เทียบรหัสเขตกับคอลัมน์ dcode ในข้อมูลจริง
-  for (const [file, column] of [["universities_clean.csv", "DISTRICT"], ["cleaned ที่ตั้งห้างสรรพสินค้า.csv", "dname"]]) {
-    for (const row of readCsv(file)) {
-      const district = byShortName.get(normalizeDistrict(row[column]));
-      if (district && row.dcode && String(toNumber(row.dcode)) !== district.id) {
-        warnings.push(`dcode ไม่ตรง: ${district.name} ตาราง=${district.id} ไฟล์ ${file}=${row.dcode}`);
-      }
-    }
-  }
 
   // สถานที่แต่ละประเภท
   const places = [];
@@ -150,7 +158,9 @@ function buildData() {
       }
       const lat = toNumber(row[source.lat]);
       const lng = toNumber(row[source.lng]);
-      const validCoordinate = lat !== null && lng !== null && lat >= 13 && lat <= 14 && lng >= 100 && lng <= 101
+      const insideBounds = !bounds
+        || (lat >= bounds.minLat && lat <= bounds.maxLat && lng >= bounds.minLng && lng <= bounds.maxLng);
+      const validCoordinate = lat !== null && lng !== null && insideBounds
         && !(source.flag && isFlagged(row[source.flag]));
       const uniqueKey = `${row[source.id ?? source.name]}|${row[source.lat]}|${row[source.lng]}`;
       if (seen.has(uniqueKey)) continue;
@@ -215,19 +225,103 @@ function buildData() {
     if (!district.zone) warnings.push(`${district.name} ไม่มีข้อมูลกลุ่มเขต`);
   }
 
-  // ผู้โดยสาร BTS รายสถานี (ไฟล์ไม่มีคอลัมน์เขต)
-  const months = ["JAN", "FEB", "MAR", "APR", "MAY", "JUN", "JUL", "AUG", "SEP", "OCT", "NOV", "DEC"];
-  const btsStations = readCsv("bts_passengers_clean.csv").map((row) => ({
-    name: row.STATION_NAME.trim(),
-    total: toNumber(row.TOTAL_PASSENGER),
-    monthly: months.map((month) => toNumber(row[`${month}_PASSENGER`])),
-  })).sort((a, b) => b.total - a.total);
 
-  return { districts, places, householdYears, btsStations, years, warnings };
+  // ---------- ข้อมูลเพิ่มสำหรับหน้ารายละเอียดเขต (ค้นหาจาก navbar) ----------
+
+  // พื้นที่ ตร.กม. คำนวณจากขอบเขตเขตใน data/bangkok-districts.json (ถ้าไม่มีไฟล์ = null)
+  if (geo) {
+    for (const feature of geo.features ?? []) {
+      const district = districts.find(({ id }) => id === String(feature.properties?.dcode))
+        ?? byShortName.get(normalizeDistrict(feature.properties?.dname));
+      if (district) district.area = Number((geometryArea(feature.geometry) / 1e6).toFixed(2));
+    }
+  }
+
+  // โรงเรียนที่เปิดชั้นอนุบาล
+  const kindergartens = new Map();
+  for (const row of readCsv("kindergarten_clean.csv")) {
+    const district = byShortName.get(normalizeDistrict(row.district));
+    if (district) kindergartens.set(district.id, (kindergartens.get(district.id) ?? 0) + 1);
+  }
+
+  // จุดเสี่ยงกลุ่ม "จุดมืด จุดเปลี่ยว" ของปีล่าสุด
+  const darkPoints = new Map();
+  for (const row of readCsv("risk_points_clean.csv")) {
+    const district = byShortName.get(normalizeDistrict(row.AreaDist));
+    if (!district || toNumber(row.AFiscalYeal) !== years.risk) continue;
+    if (String(row.AGroup).includes("จุดมืด")) darkPoints.set(district.id, (darkPoints.get(district.id) ?? 0) + 1);
+  }
+
+  // จำนวนนักศึกษามหาวิทยาลัย
+  const students = new Map();
+  for (const row of readCsv("universities_clean.csv")) {
+    const district = byShortName.get(normalizeDistrict(row.DISTRICT));
+    const count = toNumber(row.num_students);
+    if (district && count != null) students.set(district.id, (students.get(district.id) ?? 0) + count);
+  }
+
+  for (const district of districts) {
+    district.kindergartenCount = kindergartens.get(district.id) ?? 0;
+    district.darkPointCount = darkPoints.get(district.id) ?? 0;
+    district.students = students.get(district.id) ?? null;
+    district.density = district.area > 0 && district.population != null
+      ? Math.round(district.population / district.area)
+      : null;
+  }
+
+  // อันดับประชากรและความหนาแน่น (1 = มากที่สุด)
+  const rank = (key) => {
+    const sorted = districts.filter((district) => district[key] != null).sort((a, b) => b[key] - a[key]);
+    sorted.forEach((district, index) => { district[`${key}Rank`] = index + 1; });
+  };
+  rank("population");
+  rank("density");
+
+  return { districts, places, householdYears, years, warnings };
 }
 
-// โหลดข้อมูลแบบไม่ล้ม: ถ้าไฟล์ CSV หาย จะปิดแค่ route ของ Dashboard (ตอบ 503)
-// server.js ของเพื่อน (/predict, /api/districts/profiles) ยังทำงานต่อได้ตามปกติ
+// กรอบสี่เหลี่ยมที่ครอบทุกเขต
+function geometryBounds(geometries) {
+  const bounds = { minLat: Infinity, maxLat: -Infinity, minLng: Infinity, maxLng: -Infinity };
+  const visit = (coords) => {
+    if (typeof coords[0] === "number") {
+      const [lng, lat] = coords;
+      bounds.minLat = Math.min(bounds.minLat, lat);
+      bounds.maxLat = Math.max(bounds.maxLat, lat);
+      bounds.minLng = Math.min(bounds.minLng, lng);
+      bounds.maxLng = Math.max(bounds.maxLng, lng);
+    } else coords.forEach(visit);
+  };
+  geometries.forEach((geometry) => geometry?.coordinates && visit(geometry.coordinates));
+  return Number.isFinite(bounds.minLat) ? bounds : null;
+}
+
+// พื้นที่ของ Polygon / MultiPolygon หน่วยตารางเมตร (สูตรเดียวกับ turf.area)
+function ringArea(coords) {
+  const radius = 6378137; // รัศมีโลก (เมตร) ค่ามาตรฐาน WGS84 ใช้ในสูตรคำนวณพื้นที่ ไม่ใช่ข้อมูล
+  const rad = (degree) => (degree * Math.PI) / 180;
+  let total = 0;
+  for (let i = 0; i < coords.length; i += 1) {
+    const p1 = coords[i];
+    const p2 = coords[(i + 1) % coords.length];
+    const p3 = coords[(i + 2) % coords.length];
+    total += (rad(p3[0]) - rad(p1[0])) * Math.sin(rad(p2[1]));
+  }
+  return Math.abs((total * radius * radius) / 2);
+}
+
+function polygonArea(rings) {
+  return rings.reduce((sum, ring, index) => sum + (index === 0 ? ringArea(ring) : -ringArea(ring)), 0);
+}
+
+function geometryArea(geometry) {
+  if (geometry?.type === "Polygon") return polygonArea(geometry.coordinates);
+  if (geometry?.type === "MultiPolygon") return geometry.coordinates.reduce((sum, polygon) => sum + polygonArea(polygon), 0);
+  return 0;
+}
+
+// โหลดข้อมูลแบบไม่ล้ม: ถ้าไฟล์ CSV หาย จะปิดแค่ /api/district-details (ตอบ 503)
+// route อื่นใน server.js ยังทำงานต่อได้ตามปกติ
 let DATA = null;
 let LOAD_ERROR = null;
 try {
@@ -236,57 +330,69 @@ try {
   console.log(`[data-api] โหลดข้อมูลแล้ว ${DATA.districts.length} เขต, ${DATA.places.length} สถานที่`);
 } catch (error) {
   LOAD_ERROR = error;
-  console.error(`[data-api] โหลดข้อมูล Dashboard ไม่สำเร็จ: ${error.message}`);
+  console.error(`[data-api] โหลดข้อมูลเขตไม่สำเร็จ: ${error.message}`);
 }
 
 // ---------- รูปแบบข้อมูลที่ส่งให้ frontend ----------
 function districtSummary(district) {
-  const { id, name, shortName, zone, population, area, poiCount, placeCounts, mapCenter } = district;
-  return { id, name, shortName, zone, population, area, poiCount, placeCounts, mapCenter };
+  const { id, name, shortName, zone, population, area, density, poiCount, placeCounts, mapCenter } = district;
+  return { id, name, shortName, zone, population, area, density, poiCount, placeCounts, mapCenter };
 }
 
-function dashboardPayload() {
-  const { districts, householdYears, btsStations, years } = DATA;
+// รายละเอียดเขตสำหรับหน้าค้นหาจาก navbar (รูปแบบตรงกับ prop `district` ของ DistrictDetails)
+function districtProfile(district) {
+  const ofType = (type) => DATA.places.filter((place) => place.districtId === district.id && place.type === type);
+  const names = (type, limit = 3) => ofType(type).map(({ name }) => name).filter(Boolean).slice(0, limit).join(" · ") || null;
+  const latestHouseholds = district.households?.at(-1) ?? null;
+  const { placeCounts } = district;
+
   return {
     isExample: false,
-    years: {
-      population: null, // ไฟล์ประชากรไม่ระบุปี
-      places: null,
-      risk: years.risk ?? null,
-      households: { from: householdYears[0], to: householdYears.at(-1) },
-    },
-    summary: {
-      districtCount: districts.length,
-      population: districts.reduce((sum, district) => sum + (district.population ?? 0), 0),
-      placeCount: districts.reduce((sum, district) => sum + district.poiCount, 0),
-    },
-    clusters: [], // โมเดลจัดกลุ่มรายพิกัด ยังไม่มีผลรายเขต
-    populationDistricts: districts.map(({ id, name, population }) => ({ id, name, population })),
-    districts: districts.map(({ id, name, population, area }) => ({ id, name, population, area })),
-    placeCountsByDistrict: Object.fromEntries(districts.map(({ id, placeCounts }) => [id, placeCounts])),
-    housing: {
-      years: householdYears,
-      districts: districts.map(({ id, name, shortName, households }) => ({ id, name, district: shortName, counts: households })),
-    },
-    bts: { stations: btsStations },
-    // พื้นที่ ตร.กม. ไม่มีใน backend frontend ใส่เอง
-    zones: [...new Set(districts.map(({ zone }) => zone).filter(Boolean))].map((zone) => ({
-      name: zone,
-      districts: districts.filter((district) => district.zone === zone).map(({ id, name }) => ({ id, name })),
-    })),
-  };
-}
-
-function districtDetail(district) {
-  return {
-    ...districtSummary(district),
-    male: district.male,
-    female: district.female,
+    id: district.id,
+    name: district.name,
+    shortName: district.shortName,
+    zone: district.zone,
+    description: district.zone ? `${district.name} อยู่ในกลุ่มเขต${district.zone} ของกรุงเทพมหานคร` : null,
+    mapCenter: district.mapCenter,
     totalDistricts: DATA.districts.length,
-    households: { years: DATA.householdYears, counts: district.households },
-    places: DATA.places
-      .filter((place) => place.districtId === district.id && place.type !== "risk")
-      .map(({ type, name, lat, lng }) => ({ type, name, lat, lng })),
+
+    area: district.area,
+    density: district.density,
+    densityRank: district.densityRank ?? null,
+    subdistrictCount: null, // ยังไม่มีข้อมูลแขวงใน backend
+    households: latestHouseholds,
+    householdsYear: latestHouseholds == null ? null : DATA.householdYears.at(-1),
+
+    population: district.population,
+    populationRank: district.populationRank ?? null,
+    malePopulation: district.male,
+    femalePopulation: district.female,
+
+    transport: null, // ไฟล์ผู้โดยสาร BTS ไม่มีคอลัมน์เขต จึงยังแยกสถานีรายเขตไม่ได้
+    education: {
+      universityCount: placeCounts.university,
+      universities: names("university"),
+      students: district.students,
+      schoolCount: placeCounts.school,
+      kindergartenCount: district.kindergartenCount,
+    },
+    dailyLife: [
+      { label: "ห้างสรรพสินค้า / ศูนย์การค้า", count: placeCounts.mall, detail: names("mall") },
+      { label: "ศาสนสถานและวัด", count: placeCounts.temple, detail: names("temple") },
+      { label: "ศูนย์บริการสาธารณสุข", count: placeCounts.health, detail: names("health") },
+    ],
+    safety: {
+      riskCount: placeCounts.risk,
+      year: DATA.years.risk ?? null,
+      darkOrIsolatedCount: district.darkPointCount,
+    },
+
+    // ตารางเทียบความหนาแน่น: 6 เขตที่หนาแน่นที่สุด (frontend ตัดเขตตัวเองออกเหลือ 5)
+    densityRanking: DATA.districts
+      .filter(({ density }) => density != null)
+      .sort((a, b) => b.density - a.density)
+      .slice(0, 6)
+      .map(({ id, name, population, area, density }) => ({ id, name, population, area, density })),
   };
 }
 
@@ -301,7 +407,7 @@ function searchDistricts(query, limit) {
 }
 
 function findDistrict(idOrName) {
-  const value = decodeURIComponent(idOrName);
+  const value = String(idOrName);
   return DATA.districts.find((district) => district.id === value)
     ?? DATA.districts.find((district) => district.shortName === normalizeDistrict(value));
 }
@@ -316,56 +422,30 @@ function send(res, status, body) {
   res.end(JSON.stringify(body));
 }
 
-// ตอบเฉพาะ route ของไฟล์นี้ แล้วคืนค่า true
-// route อื่น (เช่น /api/districts/profiles หรือ POST ของเพื่อน) คืนค่า false ให้ server.js จัดการต่อ
+// ตอบเฉพาะ /api/district-details/:id แล้วคืนค่า true
+// route อื่นทั้งหมด (Dashboard ของเพื่อน, /predict, /api/districts/profiles) คืนค่า false ให้ server.js จัดการต่อ
 function handleDataRequest(req, res) {
   if (req.method !== "GET") return false;
 
   const url = new URL(req.url, "http://localhost");
-  const route = url.pathname.replace(/\/+$/, "");
-  const isOurRoute = ["/api/dashboard", "/api/districts", "/api/search"].includes(route)
-    || /^\/api\/districts\/[^/]+$/.test(route);
-  if (!isOurRoute) return false;
+  const match = /^\/api\/district-details\/([^/]+)\/?$/.exec(url.pathname);
+  if (!match) return false;
+
   if (!DATA) {
-    // ไม่แย่ง /api/districts/xxx ที่ไม่ใช่ของเรา (เช่น profiles) ตอนข้อมูลเราโหลดไม่ได้
-    if (route.startsWith("/api/districts/")) return false;
-    send(res, 503, { error: `ข้อมูล Dashboard ยังไม่พร้อม: ${LOAD_ERROR?.message ?? "unknown"}` });
+    send(res, 503, { error: `ข้อมูลเขตยังไม่พร้อม: ${LOAD_ERROR?.message ?? "unknown"}` });
     return true;
   }
+
   try {
-    return routeDataRequest(route, url, res);
+    const query = decodeURIComponent(match[1]);
+    const district = findDistrict(query);
+    if (district) send(res, 200, districtProfile(district));
+    else send(res, 404, { error: `ไม่พบเขต "${query}"`, suggestions: searchDistricts(query, 5) });
   } catch (error) {
     console.error("[data-api]", error);
-    send(res, 500, { error: "data-api error" });
-    return true;
+    send(res, error instanceof URIError ? 400 : 500, { error: "ค้นหาเขตไม่สำเร็จ" });
   }
-}
-
-function routeDataRequest(route, url, res) {
-
-  if (route === "/api/dashboard") {
-    send(res, 200, dashboardPayload());
-    return true;
-  }
-  if (route === "/api/districts") {
-    send(res, 200, DATA.districts.map(districtSummary));
-    return true;
-  }
-  if (route === "/api/search") {
-    const query = url.searchParams.get("q") ?? "";
-    const limit = Math.min(Math.max(Number(url.searchParams.get("limit")) || 10, 1), 50);
-    send(res, 200, { query, results: searchDistricts(query, limit) });
-    return true;
-  }
-
-  // /api/districts/1026 หรือ /api/districts/ดินแดง (ส่วนเดียว และต้องเป็นเขตที่มีจริง)
-  const match = /^\/api\/districts\/([^/]+)$/.exec(route);
-  const district = match && findDistrict(match[1]);
-  if (district) {
-    send(res, 200, districtDetail(district));
-    return true;
-  }
-  return false;
+  return true;
 }
 
 module.exports = { handleDataRequest, parseCsv, normalizeDistrict };
